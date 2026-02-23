@@ -21,18 +21,20 @@ function createUnityInstance(canvas, config, onProgress) {
   function errorListener(e) {
     var error = e.reason || e.error;
     var message = error ? error.toString() : (e.message || e.reason || '');
-    var filename = e.filename || (error && (error.fileName || error.sourceURL)) || '';
-    var lineno = e.lineno || (error && (error.lineNumber || error.line)) || 0;
-    var stack = (error && error.stack) ? error.stack.toString() : (filename && lineno ? 'at ' + filename + ':' + lineno : '');
-
-    if (message === '')
-      message = 'An unspecified error occured.';
+    var stack = (error && error.stack) ? error.stack.toString() : '';
 
     // Do not repeat the error message if it's present in the stack trace.
     if (stack.startsWith(message)) {
       stack = stack.substring(message.length);
     }
+
     message += '\n' + stack.trim();
+
+    if (!message || !Module.stackTraceRegExp || !Module.stackTraceRegExp.test(message))
+      return;
+
+    var filename = e.filename || (error && (error.fileName || error.sourceURL)) || '';
+    var lineno = e.lineno || (error && (error.lineNumber || error.line)) || 0;
 
     errorHandler(message, filename, lineno);
   }
@@ -52,7 +54,7 @@ function createUnityInstance(canvas, config, onProgress) {
       preserveDrawingBuffer: false,
       powerPreference: 2,
     },
-    wasmFileSize: 55382008,
+    wasmFileSize: 54862029,
     streamingAssetsUrl: "StreamingAssets",
     downloadProgress: {},
     deinitializers: [],

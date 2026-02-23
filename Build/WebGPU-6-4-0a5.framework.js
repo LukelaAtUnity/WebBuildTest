@@ -27,7 +27,7 @@ Module['ready'] = new Promise((resolve, reject) => {
   readyPromiseResolve = resolve;
   readyPromiseReject = reject;
 });
-["_main","getExceptionMessage","___get_exception_message","_free","___cpp_exception","___cxa_increment_exception_refcount","___cxa_decrement_exception_refcount","___thrown_object_from_unwind_exception","_GetFakemodTimeInSeconds","_ReleaseKeys","_GetCopyBufferAsCStr","_getMetricsInfo","_SendMessageNumber","_SendMessageString","_SendMessage","_SetFullscreen","_ConnectToProfiler","_StopProfiling","_IsConnectedToProfiler","_SendPasteEvent","_fflush","onRuntimeInitialized"].forEach((prop) => {
+["_main","getExceptionMessage","___get_exception_message","_free","___cpp_exception","___cxa_increment_exception_refcount","___cxa_decrement_exception_refcount","___thrown_object_from_unwind_exception","_GetFakemodTimeInSeconds","_ReleaseKeys","_GetCopyBufferAsCStr","_getMetricsInfo","_SendMessageFloat","_SendMessageString","_SendMessage","_SetFullscreen","_ConnectToProfiler","_StopProfiling","_IsConnectedToProfiler","_SendPasteEvent","_fflush","onRuntimeInitialized"].forEach((prop) => {
   if (!Object.getOwnPropertyDescriptor(Module['ready'], prop)) {
     Object.defineProperty(Module['ready'], prop, {
       get: () => abort('You are getting ' + prop + ' on the Promise object, instead of the instance. Use .then() to get called back with the instance, see the MODULARIZE docs in src/settings.js'),
@@ -269,6 +269,8 @@ function assignNewVideoInputId() {
 
 function updateVideoInputDevices(devices) {
 	videoInputDevicesSuccessfullyEnumerated = true;
+	// we're going to clear the list of videoInputDevices and regenerate it to get more accurate info after being granted camera access
+	videoInputDevices = [];
 	var retainedDevices = {};
 	var newDevices = [];
 
@@ -277,13 +279,7 @@ function updateVideoInputDevices(devices) {
 		if (device.kind === 'videoinput') { // Only interested in WebCam inputs
 			var oldDevice = matchToOldDevice(device);
 			if (oldDevice) {
-				var updatedOldDevice = oldDevice;
-				if (device.isFrontFacing != undefined)
-				{
-					// if we got an updated facing mode after getting device permissions, update just that property
-					updatedOldDevice.isFrontFacing = device.isFrontFacing;
-				}
-				retainedDevices[oldDevice.id] = updatedOldDevice;
+				retainedDevices[oldDevice.id] = oldDevice;
 			} else {
 				newDevices.push(device);
 			}
@@ -300,10 +296,11 @@ function updateVideoInputDevices(devices) {
 			// name is probably better than a long hash)
 			device.name = device.label || ("Video input #" + (device.id + 1));
 
-			// This is the "old"/backup way of checking whether a camera is front facing
-			// It doesn't work for non-English languages since it looks for the English word "front"
-			// We only want to use this method if we aren't able to get permissions from the user to access the web camera, which lets us access the facing mode
-			// If there's no "front" or "back" in the label or name, we're going to assume it's front facing, which is generally the case
+			// Chrome 85 on Android labels camera provides devices with labels like
+			// "camera2 0, facing back" and "camera2 1, facing front", use that to
+			// determine whether the device is front facing or not.
+			// some labels don't provide that info, like the camera on a 2019 MacbookPro: FaceTime HD Camera (Built-in)
+			// so if there's no "front" or "back" in the label or name, we're going to assume it's front facing
 			device.isFrontFacing = device.name.toLowerCase().includes('front') || (!(device.name.toLowerCase().includes('front')) && !(device.name.toLowerCase().includes('back')));
 
 			videoInputDevices[device.id] = device;
@@ -330,30 +327,6 @@ function removeEnumerateMediaDevicesRunDependency() {
 		// createUnityInstance().
 		Module.startupErrorHandler(e);
 	};
-}
-
-function queueWebCamDeviceUpdates(devices) {
-	devices = devices.filter(device => device.kind === "videoinput");
-	var promises = devices.map(function(device) {
-		return navigator.mediaDevices.getUserMedia({
-		video: { deviceId: device.deviceId }
-		}).then(function(stream) {
-			var track = stream.getVideoTracks()[0];
-			const capabilities = track.getCapabilities();
-			// Check if device has "user" in facingMode array, which indicates it is front facing
-			// If we fail to get the capabilities property, set isFrontFacing to true by default
-			device.isFrontFacing = Array.isArray(capabilities.facingMode)
-				? capabilities.facingMode.includes("user")
-				: true;
-			track.stop();
-		}).catch(function(err) {
-			var deviceId = device.deviceId ?? "unknown";
-			var label = device.label ?? "unknown";
-			console.warn(`Device with id: ${deviceId} and label: ${label} failed to update\n ${err}`)}
-		)
-	});
-
-	return promises;
 }
 
 function enumerateMediaDeviceList() {
@@ -429,7 +402,7 @@ function SendMessage(gameObject, func, param) {
             _SendMessageString(gameObject_cstr, func_cstr, param_cstr);
         }
         else if (typeof param === "number")
-            _SendMessageNumber(gameObject_cstr, func_cstr, param);
+            _SendMessageFloat(gameObject_cstr, func_cstr, param);
         else
             throw "" + param + " is does not have a type which is supported by SendMessage.";
 
@@ -2001,27 +1974,22 @@ function dbg(text) {
   		navigator.mediaDevices.getUserMedia({
   			audio: false,
   			video: true
-  		}).then(function() {
-  			// getUserMedia requests for permission (we want this) and starts the webcam (we don't want this), we're going to immediately turn it off after getting permission
+  		}).then(function(stream) {
+          	//getUserMedia requests for permission (we want this) and starts the webcam (we don't want this), we're going to immediately turn it off after getting permission
+        		var tracks = stream.getVideoTracks();
+        		tracks.forEach(function(track) {
+          		track.stop();
+        		});
   			cameraAccess = 1;
   			navigator.mediaDevices.enumerateDevices().then(function(devices) {
-  				var promises = queueWebCamDeviceUpdates(devices);
-  				Promise.race([
-  					Promise.all(promises),
-  					// Sometimes calls to getUserMedia hang and don't return any new information, so adding a timeout here was necessary
-  					// See https://jira.unity3d.com/browse/PLAT-15877 for more information on this bug
-  					new Promise((_, reject) => setTimeout(() => reject("Timed out while waiting for device details. Some details may be inaccurate."), 3000))
-  				]).finally(() => {
-  					// Even if we can't get permissions on some devices, update the device list with the info we could get
-  					updateVideoInputDevices(devices);
-  					getWasmTableEntry(onWebcamAccessResponse)(op);
-  				});
+  				updateVideoInputDevices(devices);
+  				getWasmTableEntry(onWebcamAccessResponse)(op);
   			});
-  		}).catch(function(err) {
+        	}).catch(function(err) {
   			cameraAccess = 2;
   			getWasmTableEntry(onWebcamAccessResponse)(op);
-  		});
-  	}
+        	});
+    	}
 
   var ExceptionsSeen = 0;
   
@@ -2115,22 +2083,6 @@ function dbg(text) {
   		}
   		return _JS_DOM_UnityCanvasSelector.ptr;
   	}
-
-  
-  function _JS_DownloadTextFile(pathPtr, dataPtr, mimeTypePtr) {
-          const path = UTF8ToString(pathPtr); 
-          const text = UTF8ToString(dataPtr); 
-          const mimeType = mimeTypePtr ? UTF8ToString(mimeTypePtr) : 'application/json';
-  
-          const parts = path.split(/[\\/]/);
-          const filename = parts.pop();
-  
-          const link = document.createElement('a');
-          link.href = URL.createObjectURL(new Blob([text], { type: mimeType }));
-          link.download = filename;
-          link.click();
-          URL.revokeObjectURL(link.href);
-      }
 
   
   function _JS_Eval_OpenURL(ptr)
@@ -2584,77 +2536,6 @@ function dbg(text) {
   		stringToUTF8(trace, buffer, bufferSize);
   	return lengthBytesUTF8(trace);	
   }
-
-  var Microphone_Access = 0;
-  function _JS_Microphone_GetCurrentAccessState() {
-          return Microphone_Access;
-      }
-
-  var MediaAccessState = {Unknown:0,Granted:1,Denied:2};
-  
-  
-  var Microphone_DeviceChangeHandlerAttached = false;
-  
-  var Microphones = [];
-  
-  
-  function Microphone_UpdateDevices() {
-          Microphones = [];
-  
-          if (Microphone_Access != MediaAccessState.Granted)
-              return Promise.resolve();
-  
-          return navigator.mediaDevices.enumerateDevices().then(function (devices) {
-              devices.forEach((device) => {
-                  // Skip non audio input devices
-                  if (device.kind !== 'audioinput')
-                      return;
-  
-                  device.name = device.label || `Audio input #${device.id+1}`;
-                  Microphones.push(device);
-              });
-          });
-      }
-  
-  function _JS_Microphone_GetPermissionAsync(op, onMicrophone_AccessResponse) {
-          if (!navigator.mediaDevices) {
-              Microphone_Access = MediaAccessState.Denied;
-              getWasmTableEntry(onMicrophone_AccessResponse) (op);
-              return;
-          }
-  
-          navigator.mediaDevices.getUserMedia({
-              audio: true,
-              video: false,
-          }).then(function (stream) {
-              // Disable tracks in stream since we do not want to record yet
-              const tracks = stream.getAudioTracks();
-              tracks.forEach(function (track) {
-                  track.enabled = false;
-              });
-              Microphone_Access = MediaAccessState.Granted;
-  
-              // Update list of audio devices now that we have permission
-              return Microphone_UpdateDevices();
-          }).then(function() {
-              // Register device change handler to update device list when necessary
-              if (!Microphone_DeviceChangeHandlerAttached) {
-                  navigator.mediaDevices.addEventListener('devicechange', Microphone_UpdateDevices);
-                  Microphone_DeviceChangeHandlerAttached = true;
-              }
-  
-              // Finalize permission request
-              getWasmTableEntry(onMicrophone_AccessResponse) (op);
-          }).catch(function (err) {
-              Microphone_Access = MediaAccessState.Denied;
-              // Remove device change handler when authorization was revoked
-              if (Microphone_DeviceChangeHandlerAttached) {
-                  navigator.mediaDevices.removeEventListener('devicechange', Microphone_UpdateDevices);
-                  Microphone_DeviceChangeHandlerAttached = false;
-              }
-              getWasmTableEntry(onMicrophone_AccessResponse) (op);
-          });
-      }
 
   
   
@@ -6447,14 +6328,7 @@ function dbg(text) {
   		}
   	}
 
-  var WEBAudio = {audioInstanceIdCounter:0,audioInstances:{},microphoneSoundClips:{},audioContext:null,audioWebEnabled:0,audioCache:[],pendingAudioSources:{},FAKEMOD_SAMPLERATE:44100,audioContextSuspendedTime:0,audioContextResumeOffset:0,contextIsRunning:false,soundsPendingContextResume:[]};
-  function _JS_Sound_GetAudioContextSampleRate()
-  {
-  	if (WEBAudio.audioWebEnabled == 0)
-  		return WEBAudio.FAKEMOD_SAMPLERATE;
-  	return WEBAudio.audioContext.sampleRate;
-  }
-  
+  var WEBAudio = {audioInstanceIdCounter:0,audioInstances:{},audioContext:null,audioWebEnabled:0,audioCache:[],pendingAudioSources:{},FAKEMOD_SAMPLERATE:44100,audioContextSuspendedTime:0,audioContextResumeOffset:0,contextIsRunning:false,soundsPendingContextResume:[]};
   function jsAudioMixinSetPitch(source) {
   	// Add a helper to AudioBufferSourceNode which gives the current playback position of the clip in seconds.
   	source.estimatePlaybackPosition = function () {
@@ -6552,7 +6426,7 @@ function dbg(text) {
   	soundClip.getFrequency = function () {
   		if (!this.buffer) {
   			console.log ("Trying to get metadata of sound which is not loaded.");
-  			return _JS_Sound_GetAudioContextSampleRate();
+  			return 0;
   		}
   
   		return this.buffer.sampleRate;
@@ -6569,7 +6443,6 @@ function dbg(text) {
   
   		var source = WEBAudio.audioContext.createBufferSource();
   		source.buffer = this.buffer;
-  		source.release = function () { };
   		jsAudioMixinSetPitch(source);
   
   		return source;
@@ -6583,7 +6456,6 @@ function dbg(text) {
   	var channel = {
   		callback: callback,
   		userData: userData,
-  		soundClip: null, // currently played sound clip
   		source: null,
   		gain: WEBAudio.audioContext.createGain(),
   		panner: WEBAudio.audioContext.createPanner(),
@@ -6620,7 +6492,6 @@ function dbg(text) {
   
   		try {
   			var self = this;
-  			this.soundClip = soundClip;
   			this.source = soundClip.createSourceNode();
   			this.configurePanningNodes();
   			this.setSpatialBlendLevel(this.spatialBlendLevel);
@@ -6655,7 +6526,6 @@ function dbg(text) {
   		}
   
   		// stop source currently playing.
-  		this.soundClip = null;
   		try {
   			channel.source.stop(WEBAudio.audioContext.currentTime + delay);
   		} catch (e) {
@@ -6686,10 +6556,6 @@ function dbg(text) {
   			return this.source.mediaElement.paused || this.source.pauseRequested;
   		}
   
-  		if (typeof this.source.isPaused === 'function') {
-  			return this.source.isPaused();
-  		}
-  
   		return false;
   	};
   
@@ -6703,12 +6569,6 @@ function dbg(text) {
   
   		if (this.source.mediaElement) {
   			this.source._pauseMediaElement();
-  			return;
-  		}
-  
-  		// Pause microphone source
-  		if (typeof this.source.pause === 'function') {
-  			this.source.pause();
   			return;
   		}
   
@@ -6744,12 +6604,6 @@ function dbg(text) {
   		// directly play it again.
   		if (this.source && this.source.mediaElement) {
   			this.source.start(undefined, this.source.currentTime);
-  			return;
-  		}
-  
-  		// If it is a microphone source start it again
-  		if (this.source && typeof this.source.resume === 'function') {
-  			this.source.resume(offset);
   			return;
   		}
   
@@ -6895,9 +6749,7 @@ function dbg(text) {
   
   		this.source.onended = null;
   		this.source.disconnect();
-  		this.source.release();
-  		this.soundClip = null;
-  		this.source = null;
+  		delete this.source;
   	};
   
   	/**
@@ -6916,7 +6768,7 @@ function dbg(text) {
   		if (needToReconfigureNodes)
   			this.configurePanningNodes();
   	}
-  
+  	
   	/**
   	 * Configure audio panning options either for 3D or 2D.
   	 */
@@ -6930,20 +6782,20 @@ function dbg(text) {
   		this.spatialBlendWetGain.disconnect();
   		this.panner.disconnect();
   		this.gain.disconnect();
-  
+  		
   		if (this.spatialBlendLevel > 0) {
   			// In 3D: SourceNode -> DryGainNode --------------> GainNode -> AudioContext.destination
   			//                    ↘ WetGainNode -> PannerNode ↗
-  
+  	
   			// Dry path
   			this.source.connect(this.spatialBlendDryGain);
   			this.spatialBlendDryGain.connect(this.gain);
-  
+  			
   			// Spatialized path
   			this.source.connect(this.spatialBlendWetGain);
   			this.spatialBlendWetGain.connect(this.panner);
   			this.panner.connect(this.gain);
-  
+  			
   		} else {
   			// In 2D: SourceNode -> GainNode -> AudioContext.destination
   			this.source.connect(this.gain);
@@ -6965,7 +6817,7 @@ function dbg(text) {
   		if (this.source.mediaElement) {
   			// Compressed audio
   			return this.source.isStopped;
-  		}
+  		} 
   
   		return false;
   	}
@@ -6982,598 +6834,6 @@ function dbg(text) {
   	return WEBAudio.audioInstanceIdCounter;
   }
 
-  
-  
-  
-  
-  function Microphone_GetMediaStream(id, channels, sampleRate) {
-          if (Microphone_Access != MediaAccessState.Granted)
-              return Promise.reject("No access rights to microphone.");
-  
-          const microphone = Microphones[id];
-          if (!microphone)
-              return Promise.reject(`Invalid id: ${id}`);
-  
-          return navigator.mediaDevices.getUserMedia({
-              audio: {
-                  deviceId: { exact: microphone.deviceId },
-                  // Try to request the desired channel count and sample rate to avoid resampling.
-                  channelCount: {
-                      ideal: channels
-                  },
-                  sampleRate: {
-                      ideal: sampleRate
-                  }
-              },
-              video: false,
-          }).then(function (stream) {
-              const tracks = stream.getAudioTracks();
-              tracks.forEach(function (track) {
-                  track.enabled = true;
-              });
-  
-              return stream;
-          }).catch(function (err) {
-              console.error(`Error accessing microphone: ${err}`)
-              return err;
-          });
-      }
-  
-  function Microphone_CopyAudioBuffer(sourceBuffer, destinationBuffer, trimStart) {
-          const sampleCount = Math.min(sourceBuffer.length, destinationBuffer.length);
-          const startOffset = Math.max(0, sourceBuffer.length - sampleCount);
-          if (sourceBuffer.numberOfChannels === destinationBuffer.numberOfChannels) {
-              // Same number of channels, copy each channel
-              for (let channel = 0; channel < sourceBuffer.numberOfChannels; ++channel) {
-                  const sourceData = trimStart
-                      ? sourceBuffer.getChannelData(channel).subarray(startOffset, startOffset + sampleCount)
-                      : sourceBuffer.getChannelData(channel).subarray(0, sampleCount);
-                  const destinationData = destinationBuffer.getChannelData(channel);
-                  destinationData.set(sourceData);
-              }
-          } else if (sourceBuffer.numberOfChannels >= 1) {
-              // Just copy first channel of source to all channels of destination
-              const sourceData = trimStart
-                      ? sourceBuffer.getChannelData(0).subarray(startOffset, startOffset + sampleCount)
-                      : sourceBuffer.getChannelData(0).subarray(0, sampleCount);
-              for (let channel = 0; channel < destinationBuffer.numberOfChannels; ++channel) {
-                  const destinationData = destinationBuffer.getChannelData(channel);
-                  destinationData.set(sourceData);
-              }
-          } else {
-              throw new Error("Failed to copy audio data: source buffer does not contain data.");
-          }
-      }
-  function Microphone_DecompressAudioBuffer(compressedBuffer, destinationBuffer, trimStart) {
-          // Create a an offline audio context to perform the automatic resampling
-          const offlineContext = new OfflineAudioContext(
-              destinationBuffer.numberOfChannels,
-              destinationBuffer.length,
-              destinationBuffer.sampleRate
-          );
-  
-          // Decode audio data automatically resamples to the sample rate of the offline context
-          return offlineContext.decodeAudioData(compressedBuffer).then(function (decodedBuffer) {
-              if (decodedBuffer.sampleRate !== destinationBuffer.sampleRate)
-                  throw new Error("Resampling failed.");
-  
-              Microphone_CopyAudioBuffer(decodedBuffer, destinationBuffer, trimStart);
-          });
-      }
-  
-  function Microphone_CreateSoundClipForRecording(channels, length, sampleRate) {
-          const soundClip = {
-              deviceId: null,
-              recordBuffer: WEBAudio.audioContext.createBuffer(channels, length, sampleRate),
-              loopRecording: false,
-              mediaStream: null,
-              mediaRecorder: null,
-              recordStartTime: 0,
-              isRecording: false,
-              isDecompressed: false,
-              chunks: [],
-              sourceNodes: []
-          };
-  
-          soundClip.recordStart = function (deviceId, loopRecording) {
-              if (Microphone_Access != MediaAccessState.Granted) {
-                  console.warn("Can't create SoundClip from microphone because access is blocked by user.");
-                  return;
-              }
-              soundClip.deviceId = deviceId;
-              soundClip.loopRecording = loopRecording;
-  
-              // Get media stream for the microphone device async
-              return Microphone_GetMediaStream(deviceId, soundClip.recordBuffer.numberOfChannels, soundClip.recordBuffer.sampleRate).then(function(stream) {
-                  soundClip.mediaStream = stream;
-                  soundClip.chunks = [];
-                  const mediaRecorder = new MediaRecorder(stream);
-                  const maxChunks = Math.ceil(soundClip.recordBuffer.length / (sampleRate * 0.1)) + 1; // 100 ms chunks + 1 extra to account for header data
-                  mediaRecorder.ondataavailable = function (event) {
-                      if (soundClip.loopRecording && soundClip.chunks.length >= maxChunks) {
-                          // When looping is enabled only keep maxChunks
-                          // Remove second oldest entry. First chunk may contain header data
-                          soundClip.chunks.splice(1, 1);
-                      }
-                      const recordedDuration = WEBAudio.audioContext.currentTime - soundClip.recordStartTime;
-                      if (!soundClip.loopRecording && recordedDuration >= soundClip.recordBuffer.duration) {
-                          // If looping is disabled and we recorded enough data, stop recording
-                          soundClip.recordStop();
-                      }
-  
-                      // Add chunk to list
-                      soundClip.chunks.push(event.data);
-                  };
-                  mediaRecorder.onstop = function () {
-                      // Convert chunks to a single blob
-                      const recordedBlob = new Blob(soundClip.chunks, { mimeType: mediaRecorder.mimeType });
-                      soundClip.chunks = [];
-                      soundClip.isDecompressed = false;
-  
-                      recordedBlob.arrayBuffer().then(function(compressedBuffer) {
-                          return Microphone_DecompressAudioBuffer(compressedBuffer, soundClip.recordBuffer, soundClip.loopRecording);
-                      }).then(function() {
-                          soundClip.isDecompressed = true;
-                          soundClip.sourceNodes.forEach(function (source) {
-                              source.onSoundDataAvailable();
-                          });
-                      }).catch(function(error) {
-                          soundClip.error = true;
-                          console.error(`Decompressing recorded audio failed: ${error}`);
-                      });
-                  };
-                  soundClip.mediaRecorder = mediaRecorder;
-  
-                  soundClip.mediaRecorder.start(100); // Record in 100 ms chunks to allow looping of record buffer
-                  soundClip.recordStartTime = WEBAudio.audioContext.currentTime;
-                  soundClip.isRecording = true;
-  
-                  // Update all audio source nodes to use the new media stream
-                  soundClip.sourceNodes.forEach(function (source) {
-                      source.resetAudioSource();
-                  });
-              });
-          };
-  
-          soundClip.recordStop = function () {
-              if (!soundClip.isRecording) {
-                  return;
-              }
-              // Old content needs to be replaced by new decompressed data
-              // before clip can be played again
-              soundClip.isDecompressed = false;
-  
-              // Stop media recorder and reset clip
-              soundClip.mediaRecorder.stop();
-              soundClip.mediaRecorder = null;
-              soundClip.deviceId = null;
-              soundClip.mediaStream = null;
-              soundClip.isRecording = false;
-  
-              // Update all audio source nodes to use the buffer source
-              soundClip.sourceNodes.forEach(function (source) {
-                  source.resetAudioSource();
-              });
-          };
-  
-          /**
-           * Get current recording position in number of samples.
-           * If the sound clip is not recording, 0 is returned.
-           * If looping is enabled, the position wraps around when it reaches the end of the record buffer.
-           * @returns {number}
-           */
-          soundClip.getRecordPosition = function () {
-              if (!soundClip.isRecording)
-                  return 0;
-  
-              const recordedDuration = WEBAudio.audioContext.currentTime - soundClip.recordStartTime;
-              let recordPosition = Math.floor(recordedDuration * soundClip.recordBuffer.sampleRate);
-              if (soundClip.loopRecording)
-                  recordPosition = recordPosition % soundClip.recordBuffer.length;
-              else
-                  recordPosition = Math.min(recordPosition, soundClip.recordBuffer.length);
-  
-              return recordPosition;
-          }
-  
-          /**
-           * Release resources of a sound clip
-           */
-          soundClip.release = function () {
-              soundClip.recordStop();
-              soundClip.recordBuffer = null;
-          };
-  
-          /**
-           * Get length of sound clip in number of samples
-           * @returns {number}
-           */
-          soundClip.getLength = function () {
-              return soundClip.recordBuffer.length;
-          };
-  
-          /**
-           * Gets uncompressed audio data from sound clip.
-           * If output buffer is smaller than the sound data only the first portion
-           * of the sound data is read.
-           * If the sound clip is currently recording, no data will be returned.
-           * Sound clips with multiple channels will be stored one after the other.
-           *
-           * @param {number} ptr Pointer to the output buffer
-           * @param {number} length Size of output buffer in bytes
-           * @returns Size of data in bytes written to output buffer
-           */
-          soundClip.getData = function (ptr, length) {
-              if (soundClip.isRecording) {
-                  console.warn("Can't get data from microphone sound clip while recording is in progress.");
-                  return 0;
-              }
-  
-              if (!soundClip.isDecompressed) {
-                  console.warn("Can't get data from microphone sound clip because data is not yet decompressed.");
-                  return 0;
-              }
-  
-              // Get output buffer
-              const startOutputBuffer = (ptr >> 2);
-              const bufferLength = length >> 2;
-              const output = HEAPF32.subarray(startOutputBuffer, startOutputBuffer + bufferLength);
-              const numMaxSamples = Math.floor(bufferLength / this.recordBuffer.numberOfChannels);
-              const numReadSamples = Math.min(this.recordBuffer.length, numMaxSamples);
-  
-              // Copy audio data to outputbuffer
-              for (let i = 0; i < this.recordBuffer.numberOfChannels; i++) {
-                  const channelData = this.recordBuffer.getChannelData(i).subarray(0, numReadSamples);
-                  output.set(channelData, i * numReadSamples);
-              }
-  
-              return numReadSamples * this.recordBuffer.numberOfChannels * 4;
-          };
-  
-          /**
-           * Gets number of channels of soundclip
-           * @returns {number}
-           */
-          soundClip.getNumberOfChannels = function () {
-              return soundClip.recordBuffer.numberOfChannels;
-          };
-  
-          /**
-           * Gets sampling rate in Hz
-           * @returns {number}
-           */
-          soundClip.getFrequency = function () {
-              return soundClip.recordBuffer.sampleRate;
-          };
-  
-          /**
-           * Create an audio source node
-           * @returns {MediaStreamTrackAudioSourceNode}
-           */
-          soundClip.createSourceNode = function () {
-              // Create a GainNode to be used as a "MicrophoneSource" and implement
-              // an interface similar to other audio source nodes of the Web Audio API.
-              // The actually used audio source node will be changed depending on if
-              // the sound clip is recording or not.
-              const microphoneSource = WEBAudio.audioContext.createGain();
-              soundClip.sourceNodes.push(microphoneSource);
-              microphoneSource.audioDataSourceNode = null;
-              microphoneSource._loop = false;
-              microphoneSource._loopStart = 0;
-              microphoneSource._loopEnd = soundClip.recordBuffer.duration;
-              microphoneSource._paused = false;
-              microphoneSource._muted = false;
-              microphoneSource._playbackRate = 1.0;
-              microphoneSource._onended = undefined;
-              microphoneSource._startTimeout = null;
-              microphoneSource._stopTimeout = null;
-              microphoneSource._autoStopTimeout = null;
-              microphoneSource.startTime = undefined;
-  
-              microphoneSource.resetAudioSource = function () {
-                  if (microphoneSource.audioDataSourceNode){
-                      // Disconnect old source node and remove callback
-                      microphoneSource.audioDataSourceNode.onended = null;
-                      microphoneSource.audioDataSourceNode.disconnect();
-                      microphoneSource.audioDataSourceNode = null;
-                  }
-  
-                  if (soundClip.isRecording) {
-                      const mediaStreamSource = WEBAudio.audioContext.createMediaStreamSource(soundClip.mediaStream);
-                      mediaStreamSource.connect(microphoneSource);
-                      microphoneSource.audioDataSourceNode = mediaStreamSource;
-                  } else {
-                      const bufferSource = WEBAudio.audioContext.createBufferSource();
-                      bufferSource.buffer = soundClip.recordBuffer;
-                      bufferSource.loop = microphoneSource._loop;
-                      bufferSource.loopStart = microphoneSource._loopStart;
-                      bufferSource.loopEnd = microphoneSource._loopEnd;
-                      if (typeof microphoneSource._onended === 'function')
-                          bufferSource.onended = microphoneSource._onended;
-                      bufferSource.playbackRate.value = microphoneSource._playbackRate;
-                      bufferSource.connect(microphoneSource);
-                      microphoneSource.audioDataSourceNode = bufferSource;
-                  }
-              }
-              microphoneSource.resetAudioSource();
-  
-              // Callback when decoded data is available
-              microphoneSource.onSoundDataAvailable = function () {
-                  // If sound was still playing when it switched from MediaStreamSource to BufferSource
-                  // We need to start play back from buffer source
-                  if (
-                      typeof microphoneSource.startTime !== "undefined" &&
-                      !microphoneSource.isPaused() &&
-                      microphoneSource.loop &&
-                      !microphoneSource.audioDataSourceNode.isStarted
-                  ) {
-                      microphoneSource.audioDataSourceNode.start(microphoneSource.startTime);
-                      microphoneSource.audioDataSourceNode.isStarted = true;
-                      return;
-                  }
-  
-                  // If sound was still playing but not looping
-                  // Stop playback
-                  if (
-                      typeof microphoneSource.startTime !== "undefined" &&
-                      !microphoneSource.loop
-                  ) {
-                      microphoneSource.startTime = undefined;
-                  }
-              };
-  
-              // Cleanup source node when it is disconnected
-              microphoneSource.release = function () {
-                  const index = soundClip.sourceNodes.indexOf(microphoneSource);
-                  if (index >= 0)
-                      soundClip.sourceNodes.splice(index, 1);
-              };
-  
-              // Mock some properties
-              Object.defineProperty(microphoneSource, "loop", {
-                  get: function () {
-                      return microphoneSource._loop;
-                  },
-                  set: function (v) {
-                      microphoneSource._loop = v;
-  
-                      if (!soundClip.isRecording)
-                          microphoneSource.audioDataSourceNode.loop = v;
-                  }
-              });
-              Object.defineProperty(microphoneSource, "loopStart", {
-                  get: function () {
-                      return microphoneSource._loopStart;
-                  },
-                  set: function (v) {
-                      microphoneSource._loopStart = v;
-  
-                      if (!soundClip.isRecording)
-                          microphoneSource.audioDataSourceNode.loopStart = v;
-                  }
-              });
-              Object.defineProperty(microphoneSource, "loopEnd", {
-                  get: function () {
-                      return microphoneSource._loopEnd;
-                  },
-                  set: function (v) {
-                      microphoneSource._loopEnd = v;
-  
-                      if (!soundClip.isRecording)
-                          microphoneSource.audioDataSourceNode.loopEnd = v;
-                  }
-              });
-              Object.defineProperty(microphoneSource, "mute", {
-                  get: function () {
-                      return microphoneSource.gain.value === 0;
-                  },
-                  set: function (v) {
-                      microphoneSource.gain.value = v ? 0 : 1;
-                  }
-              });
-  
-              microphoneSource.playbackRate = {};
-              Object.defineProperty(microphoneSource.playbackRate, "value", {
-                  get: function () {
-                      if (soundClip.isRecording)
-                          return 1.0;
-  
-                      return microphoneSource.audioDataSourceNode.playbackRate.value;
-                  },
-                  set: function (v) {
-                      microphoneSource._playbackRate = v;
-                      if (!soundClip.isRecording &&
-                          microphoneSource.audioDataSourceNode.playbackRate.value !== v
-                      )
-                          microphoneSource.audioDataSourceNode.playbackRate.value = v;
-                  }
-              });
-  
-              microphoneSource.estimatePlaybackPosition = function () {
-                  if (typeof microphoneSource.startTime === "undefined")
-                      return 0;
-  
-                  // Sound is played back live during recording
-                  // report record position.
-                  if (soundClip.isRecording)
-                      return soundClip.getRecordPosition() / soundClip.getFrequency();
-  
-                  // Sound is played from buffer
-                  const t = ((WEBAudio.audioContext.currentTime - microphoneSource.startTime) * microphoneSource.playbackRate.value) % soundClip.recordBuffer.duration;
-                  return t;
-              };
-  
-              microphoneSource.setPitch = function (newPitch) {
-                  if (microphoneSource.playbackRate.value !== newPitch)
-                      microphoneSource.playbackRate.value = newPitch;
-              }
-  
-              Object.defineProperty(microphoneSource, "currentTime", {
-                  get: function () {
-                      return microphoneSource.estimatePlaybackPosition();
-                  },
-                  set: function (v) {
-                      // Can't change current time of a live stream
-                  }
-              });
-  
-              Object.defineProperty(microphoneSource, "onended", {
-                  get: function () {
-                      return microphoneSource._onended;
-                  },
-                  set: function (onended) {
-                      microphoneSource._onended = onended;
-                      if (!soundClip.isRecording)
-                          microphoneSource.audioDataSourceNode.onended = onended;
-                  }
-              });
-  
-              microphoneSource.isPaused = () => microphoneSource._paused;
-  
-              microphoneSource.pause = function () {
-                  if (microphoneSource._paused)
-                      return;
-  
-                  // Live stream from microphone can't be paused
-                  // so we just mute the output instead.
-                  microphoneSource._paused = true;
-                  microphoneSource.mute = true;
-  
-                  if (!soundClip.isRecording) {
-                      // Stop the source but keep track of playback position
-                      microphoneSource.playbackPausedAtPosition = microphoneSource.estimatePlaybackPosition();
-                      microphoneSource.scheduledStartTime = microphoneSource.startTime;
-                      microphoneSource.stop();
-                      microphoneSource.audioDataSourceNode.disconnect();
-                  }
-              };
-  
-              microphoneSource.resume = function (offset) {
-                  if (!microphoneSource._paused)
-                      return;
-  
-                  // Live stream from microphone can't be paused
-                  // so we just unmute the output instead.
-                  microphoneSource._paused = false;
-                  microphoneSource.mute = false;
-  
-                  if (!soundClip.isRecording) {
-                      // Recreate buffer source as it can't be reused after stop()
-                      microphoneSource.resetAudioSource();
-                      // Restart playback from paused position
-                      // If playback start time is still scheduled in the future start later
-                      // otherwise immediatly.
-                      const startTime = (microphoneSource.scheduledStartTime > WEBAudio.audioContext.currentTime)
-                          ? microphoneSource.scheduledStartTime
-                          : WEBAudio.audioContext.currentTime;
-                      // If an offset is passed in use it.
-                      const resumeOffset = (offset == 0)
-                          ? microphoneSource.playbackPausedAtPosition
-                          : offset;
-                      microphoneSource.start(startTime, resumeOffset);
-                      microphoneSource.playbackPausedAtPosition = undefined;
-                      microphoneSource.scheduledStartTime = undefined;
-                  }
-              }
-  
-              microphoneSource.addAutoStop = function (startTime, duration) {
-                  const stopTime = startTime + duration;
-                  const stopDelayMS = (stopTime - WEBAudio.audioContext.currentTime) * 1000;
-  
-                  // Simulate stop after end of record buffer is reached similar
-                  // to playback from recorded buffer
-                  microphoneSource._autoStopTimeout = setTimeout(function () {
-                      microphoneSource._autoStopTimeout = null;
-                      if (!microphoneSource.loop) {
-                          // If source is not looping stop it immediatly and trigger onended
-                          microphoneSource.stop();
-                          if (typeof microphoneSource.onended === 'function')
-                              microphoneSource.onended();
-                      } else if (!soundClip.isRecording) {
-                          // The sound is looping don't stop it now.
-                          // But loop setting may be changed during loop, retrigger timeout
-                          // to recheck after next iteration.
-                          microphoneSource.addAutoStop(WEBAudio.audioContext.currentTime, duration);
-                      }
-                  }, stopDelayMS);
-              };
-  
-              microphoneSource.removeAutoStop = function () {
-                  if (!microphoneSource._autoStopTimeout)
-                      return;
-                  clearTimeout(microphoneSource._autoStopTimeout);
-                  microphoneSource._autoStopTimeout = null;
-              };
-  
-              microphoneSource.start = function (startTime, offset) {
-                  // Keep track of playback time
-                  microphoneSource.startTime = (typeof startTime === "undefined")
-                      ? WEBAudio.audioContext.currentTime
-                      : startTime;
-  
-                  if (soundClip.isRecording) {
-                      // Simulate delayed playback
-                      const startDelayThresholdMS = 4;
-                      const startDelayMS = (startTime - WEBAudio.audioContext.currentTime) * 1000;
-                      if (startDelayMS > startDelayThresholdMS) {
-                          // Use timeout to start at scheduled time
-                          microphoneSource._startTimeout = setTimeout(function () {
-                              // Unmute live stream to start playback
-                              microphoneSource.mute = false;
-                          }, startDelayThresholdMS);
-                      } else {
-                          // Unmute live stream to start playback
-                          microphoneSource.mute = false;
-                      }
-                      microphoneSource.addAutoStop(microphoneSource.startTime, soundClip.recordBuffer.duration);
-                  } else {
-                      // Playing back from recorded buffer
-                      if (!microphoneSource.audioDataSourceNode.isStarted)
-                          microphoneSource.audioDataSourceNode.start(startTime, offset);
-                      microphoneSource.audioDataSourceNode.isStarted = true;
-                  }
-              };
-  
-              microphoneSource.stop = function (stopTime) {
-                  microphoneSource.startTime = undefined;
-                  microphoneSource.removeAutoStop();
-                  if (soundClip.isRecording) {
-                      const stopDelayThresholdMS = 4;
-                      const stopDelayMS = (stopTime - WEBAudio.audioContext.currentTime) * 1000;
-                      if (stopDelayMS > stopDelayThresholdMS) {
-                          // Use timeout to stop at scheduled time
-                          microphoneSource._stopTimeout = setTimeout(function () {
-                              // Mute live stream to immediatly stop playback
-                              microphoneSource.mute = true;
-                          }, stopDelayThresholdMS);
-                      } else {
-                          // Mute live stream to immediatly stop playback
-                          microphoneSource.mute = true;
-                      }
-                  } else {
-                      // Stop plack from recorded buffer
-                      if (microphoneSource.audioDataSourceNode.isStarted)
-                          microphoneSource.audioDataSourceNode.stop(stopTime);
-                  }
-              };
-  
-              return microphoneSource;
-          }
-  
-          return soundClip;
-      }
-  
-  function _JS_Sound_Create_With_Buffer(channels, length, sampleRate) {
-  	if (WEBAudio.audioWebEnabled == 0)
-  		return 0;
-  
-  	var sound = Microphone_CreateSoundClipForRecording(channels, length, sampleRate);
-  
-  	WEBAudio.audioInstances[++WEBAudio.audioInstanceIdCounter] = sound;
-  
-  	return WEBAudio.audioInstanceIdCounter;
-  }
-
   function _JS_Sound_GetAudioBufferSampleRate(soundInstance)
   {
   	if (WEBAudio.audioWebEnabled == 0)
@@ -7583,20 +6843,20 @@ function dbg(text) {
   	if (!audioInstance)
   		return WEBAudio.FAKEMOD_SAMPLERATE;
   
-  	// Check if audioInstance is a SoundClip
-  	if (typeof audioInstance.getFrequency === 'function')
-  		return audioInstance.getFrequency();
+  	// Handle the case where it's a channel instance rather than a sound instance
+  	var buffer = audioInstance.buffer ? audioInstance.buffer : audioInstance.source ? audioInstance.source.buffer : 0;
+  	if (!buffer)
+  		return WEBAudio.FAKEMOD_SAMPLERATE;
   
-  	// Check if audioInstance is a Channel currently playing a SoundClip
-  	if (audioInstance.soundClip)
-  	{
-  		return audioInstance.soundClip.getFrequency();
-  	}
-  
-  	// Return fake sample rate by default
-  	return WEBAudio.FAKEMOD_SAMPLERATE;
+  	return buffer.sampleRate;
   }
 
+  function _JS_Sound_GetAudioContextSampleRate()
+  {
+  	if (WEBAudio.audioWebEnabled == 0)
+  		return WEBAudio.FAKEMOD_SAMPLERATE;
+  	return WEBAudio.audioContext.sampleRate;
+  }
 
   function _JS_Sound_GetLength(bufferInstance)
   {
@@ -7619,7 +6879,7 @@ function dbg(text) {
   	var sound = WEBAudio.audioInstances[bufferInstance];
   	if (sound.error)
   		return 2;
-  	if (sound.buffer || sound.url || sound.mediaStream || sound.isDecompressed)
+  	if (sound.buffer || sound.url)
   		return 0;
   	return 1;
   }
@@ -7672,18 +6932,8 @@ function dbg(text) {
   				while (sound !== undefined) {
   
   					// Sound was paused
-  					var stopChannel = sound.stopDelay >= 0.0;
   					if (sound.channel.source) {
-  						sound.stopDelay -= WEBAudio.audioContextResumeOffset;
-  						if (sound.stopDelay <= 0.0)
-  							sound.stopDelay = 0.0;
-  
-  						var resumeChannel = !stopChannel || (sound.stopDelay > 0.0);
-  						if (resumeChannel)
-  							sound.channel.resume(sound.offset + WEBAudio.audioContextResumeOffset);
-  
-  						if (stopChannel)
-  							sound.channel.stop(sound.stopDelay);
+  						sound.channel.resume(sound.offset + WEBAudio.audioContextResumeOffset);
   
   					// Sound was not started yet
   					} else {
@@ -7691,24 +6941,18 @@ function dbg(text) {
   						if (currentTime > sound.startTime)
   							resumeOffset = currentTime - sound.startTime;
   
-  						sound.stopDelay -= resumeOffset;
-  						if (sound.stopDelay <= 0.0)
-  							sound.stopDelay = 0.0;
-  
-  						var playSoundClip = !stopChannel || (sound.stopDelay > 0.0);
-  						if (playSoundClip) {
-  							sound.channel.playSoundClip(sound.clip, sound.startTime, sound.offset + resumeOffset);
-  
-  							if (stopChannel)
-  								sound.channel.stop(sound.stopDelay);
-  						}
+  						sound.channel.playSoundClip(
+  							sound.clip,
+  							sound.startTime,
+  							sound.offset + resumeOffset,
+  						);
   					}
   
   					sound = WEBAudio.soundsPendingContextResume.pop();
   				}
-  
+  					
   			} else {
-  
+    
   				WEBAudio.contextIsRunning = false;
   				console.log('Audio context suspended.');
   				WEBAudio.audioContextSuspendedTime = _GetFakemodTimeInSeconds();
@@ -7718,12 +6962,10 @@ function dbg(text) {
   					{
   						if (!audioInstance.isPaused()) {
   							audioInstance.pause();
-  
   							WEBAudio.soundsPendingContextResume.push({
   							channel: audioInstance,
   							clip: null,
   							startTime: null,
-  							stopDelay: -1.0,
   							offset: audioInstance.source.playbackPausedAtPosition,
   						});
   						}
@@ -7805,7 +7047,6 @@ function dbg(text) {
   
   	return soundClip;
   }
-  
   
   
   function jsAudioGetMimeTypeFromType(fmodSoundType) {
@@ -7893,7 +7134,7 @@ function dbg(text) {
   	soundClip.getFrequency = function () {
   		console.warn("getFrequency() is not supported for compressed sound.");
   
-  		return _JS_Sound_GetAudioContextSampleRate();
+  		return 0;
   	}
   
   	/**
@@ -7906,7 +7147,6 @@ function dbg(text) {
   		mediaElement.preload = "metadata";
   		mediaElement.src = this.url;
   		var source = WEBAudio.audioContext.createMediaElementSource(mediaElement);
-  		source.release = function () {};
   
   		Object.defineProperty(source, "loop", {
   			get: function () {
@@ -7934,9 +7174,6 @@ function dbg(text) {
   				if (source.mediaElement.currentTime !== v) source.mediaElement.currentTime = v;
   			}
   		});
-  		source.estimatePlaybackPosition = function () {
-  			return source.mediaElement.currentTime;
-  		};
   		Object.defineProperty(source, "mute", {
   			get: function () {
   				return source.mediaElement.mute;
@@ -8106,8 +7343,7 @@ function dbg(text) {
   			var clipped = source.subarray(0, Math.min(source.length, this.length - (startInChannel | 0)));
   			this.getChannelData(channelNumber | 0).set(clipped, startInChannel | 0);
   		};
-  		var source = HEAPF32.subarray(offs, offs + length);
-  		copyToChannel.apply(buffer, [source, i, 0]);
+  		copyToChannel.apply(buffer, [HEAPF32.subarray(offs, offs + length), i, 0]);
   	}
   
   	return jsAudioCreateUncompressedSoundClip(buffer, false);
@@ -8147,7 +7383,6 @@ function dbg(text) {
   				channel: channel,
   				clip: soundClip,
   				startTime: WEBAudio.audioContext.currentTime + delay,
-  				stopDelay: -1.0,
   				offset: offset
   			});
   		}
@@ -8316,14 +7551,7 @@ function dbg(text) {
   		return;
   
   	var channel = WEBAudio.audioInstances[channelInstance];
-  	if (WEBAudio.contextIsRunning) {
-  		channel.stop(delay);
-  	}
-  	else {
-  		const soundToStopIndex = WEBAudio.soundsPendingContextResume.findIndex(sound => sound.channel == channel);
-  		if (soundToStopIndex != -1)
-  			WEBAudio.soundsPendingContextResume[soundToStopIndex].stopDelay = delay;
-  	}
+  	channel.stop(delay);
   }
 
   function _JS_SystemInfo_GetAnimationFrameRate() {
@@ -15246,7 +14474,13 @@ function dbg(text) {
 
   function _glViewport(x0, x1, x2, x3) { GLctx.viewport(x0, x1, x2, x3) }
 
-  var GPUTextureAndVertexFormats = [,"r8unorm","r8snorm","r8uint","r8sint","r16unorm","r16snorm","r16uint","r16sint","r16float","rg8unorm","rg8snorm","rg8uint","rg8sint","r32uint","r32sint","r32float","rg16unorm","rg16snorm","rg16uint","rg16sint","rg16float","rgba8unorm","rgba8unorm-srgb","rgba8snorm","rgba8uint","rgba8sint","bgra8unorm","bgra8unorm-srgb","rgb9e5ufloat","rgb10a2uint","rgb10a2unorm","rg11b10ufloat","rg32uint","rg32sint","rg32float","rgba16unorm","rgba16snorm","rgba16uint","rgba16sint","rgba16float","rgba32uint","rgba32sint","rgba32float","stencil8","depth16unorm","depth24plus","depth24plus-stencil8","depth32float","depth32float-stencil8","bc1-rgba-unorm","bc1-rgba-unorm-srgb","bc2-rgba-unorm","bc2-rgba-unorm-srgb","bc3-rgba-unorm","bc3-rgba-unorm-srgb","bc4-r-unorm","bc4-r-snorm","bc5-rg-unorm","bc5-rg-snorm","bc6h-rgb-ufloat","bc6h-rgb-float","bc7-rgba-unorm","bc7-rgba-unorm-srgb","etc2-rgb8unorm","etc2-rgb8unorm-srgb","etc2-rgb8a1unorm","etc2-rgb8a1unorm-srgb","etc2-rgba8unorm","etc2-rgba8unorm-srgb","eac-r11unorm","eac-r11snorm","eac-rg11unorm","eac-rg11snorm","astc-4x4-unorm","astc-4x4-unorm-srgb","astc-5x4-unorm","astc-5x4-unorm-srgb","astc-5x5-unorm","astc-5x5-unorm-srgb","astc-6x5-unorm","astc-6x5-unorm-srgb","astc-6x6-unorm","astc-6x6-unorm-srgb","astc-8x5-unorm","astc-8x5-unorm-srgb","astc-8x6-unorm","astc-8x6-unorm-srgb","astc-8x8-unorm","astc-8x8-unorm-srgb","astc-10x5-unorm","astc-10x5-unorm-srgb","astc-10x6-unorm","astc-10x6-unorm-srgb","astc-10x8-unorm","astc-10x8-unorm-srgb","astc-10x10-unorm","astc-10x10-unorm-srgb","astc-12x10-unorm","astc-12x10-unorm-srgb","astc-12x12-unorm","astc-12x12-unorm-srgb","uint8","uint8x2","uint8x4","sint8","sint8x2","sint8x4","unorm8","unorm8x2","unorm8x4","snorm8","snorm8x2","snorm8x4","uint16","uint16x2","uint16x4","sint16","sint16x2","sint16x4","unorm16","unorm16x2","unorm16x4","snorm16","snorm16x2","snorm16x4","float16","float16x2","float16x4","float32","float32x2","float32x3","float32x4","uint32","uint32x2","uint32x3","uint32x4","sint32","sint32x2","sint32x3","sint32x4","unorm10-10-10-2","unorm8x4-bgra"];
+  /** @param {number=} ch */
+  function wgpuDecodeStrings(s, c, ch) {
+      ch = ch || 65;
+      for(c = c.split('|'); c[0];) s = s['replaceAll'](String.fromCharCode(ch++), c.pop());
+      return [,].concat(s.split(' '));
+    }
+  var GPUTextureAndVertexFormats = wgpuDecodeStrings('r8YN8Sr8UN8TNRYNRSrRUNRTNRWNg8YNg8Srg8UNg8TNKUNKTNKWNgRYNgRSrgRUNgRTNgRW V8Y V8Z V8SV8U V8T bgra8Y bgra8ZNgb9e5uWNgbJa2UNgbJa2YNg11bJuWNgKUNgKTNgKW VRY VRSVRU VRT VRW VKU VKT VKW FLRYL24plusL24plus-FLKWLKW-FM1-V-YM1-V-ZM2-V-YM2-V-ZM3-V-YM3-V-ZM4-r-YM4-r-Sbc5B-YM5B-Sbc6hBb-uWM6hBb-WM7-V-YM7-V-ZQYQZQa1YQa1Z etc2-V8Y etc2-V8ZC11YC11SeacB11YCg11snormX4G-YX4G-ZX5G-YX5G-ZX5A-YX5A-ZX6A-YX6A-ZX6x6-YX6x6-ZX8A-YX8A-ZX8x6-YX8x6-ZX8x8-YX8x8-ZXJA-YXJA-ZXJx6-YXJx6-ZXJx8-YXJx8-ZXJxJ-YXJxJ-ZX12xJ-YX12xJ-ZX12x12-YX12x12-Z U8 U8HU8G T8 T8HT8G Y8 Y8HY8GP8P8x2P8G UR URHURG TR TRHTRG YR YRHYRGPRPRx2PRG WR WRHWRG WK WKHWKx3 WKG UK UKHUKx3 UKG TK TKHTKx3 TKG YJ-J-J-2 Y8G-bgra', 'unorm-srgb|unorm| astc-|float|rgba|uint|sint|snorm |16| etc2-rgb8| snorm|-BC| r| bc| depth|32|10|-AC|x2 |x4|stencil8|-E-|Mg| eac-r|-rg|x5');
   function _navigator_gpu_get_preferred_canvas_format() {
       
       assert(navigator["gpu"], "Your browser does not support WebGPU!", "assert(navigator['gpu'], 'Your browser does not support WebGPU!') failed!");
@@ -15276,14 +14510,17 @@ function dbg(text) {
       assert((options >> 2) << 2 == options);
   options >>= 2;
   
-      let gpu = navigator['gpu'], opts = options ? {
-          'featureLevel': [, 'core', 'compatibility'][HEAPU32[options]],
-          'powerPreference': [, 'low-power', 'high-performance'][HEAPU32[options+1]],
-          'forceFallbackAdapter': !!HEAPU32[options+2],
-          'xrCompatible': !!HEAPU32[options+3]
-        } : {};
+      let gpu = navigator['gpu'],
+        powerPreference = [, 'low-power', 'high-performance'][HEAPU32[options]],
+        opts = {};
   
       if (gpu) {
+        if (options) {
+          opts['forceFallbackAdapter'] = !!HEAPU32[options+1];
+          opts['xrCompatible'] = !!HEAPU32[options+2];
+          if (powerPreference) opts['powerPreference'] = powerPreference;
+        }
+  
         
         function cb(adapter) {
           
@@ -15638,7 +14875,7 @@ function dbg(text) {
       return _strftime(s, maxsize, format, tm); // no locale support yet
     }
 
-  var _wgpuFeatures = ["core-features-and-limits","depth-clip-control","depth32float-stencil8","texture-compression-bc","texture-compression-bc-sliced-3d","texture-compression-etc2","texture-compression-astc","texture-compression-astc-sliced-3d","timestamp-query","indirect-first-instance","shader-f16","rg11b10ufloat-renderable","bgra8unorm-storage","float32-filterable","float32-blendable","clip-distances","dual-source-blending","subgroups","texture-formats-tier1","texture-formats-tier2","primitive-index","texture-component-swizzle"];
+  var _wgpuFeatures = wgpuDecodeStrings('coAEeatuAs-aH-lBsF-GcontrolF32M-Iencil8ObcObLOetc2OaIcOaIL timeIamp-quDy iHiActEirI-inJ shadDE16 rg11b10uM-AHDKbgra8unorm-Iorage M32EiltDKM32CKGdiJs dual-sourceCing subgroupsN1N2 prBive-iHex', ' texture-compression-| texture-formats-tier|float|c-sliced-3d|able |stance|st|nd|clip-| depth|-f|er|-bleH|imit|re').slice(1);
   function _wgpu_adapter_or_device_get_features(adapterOrDevice) {
       
       assert(adapterOrDevice != 0, "assert(adapterOrDevice != 0) failed!");
@@ -15659,9 +14896,9 @@ function dbg(text) {
       return featuresBitMask;
     }
 
-  var _wgpu32BitLimitNames = ["maxTextureDimension1D","maxTextureDimension2D","maxTextureDimension3D","maxTextureArrayLayers","maxBindGroups","maxBindGroupsPlusVertexBuffers","maxBindingsPerBindGroup","maxDynamicUniformBuffersPerPipelineLayout","maxDynamicStorageBuffersPerPipelineLayout","maxSampledTexturesPerShaderStage","maxSamplersPerShaderStage","maxStorageBuffersPerShaderStage","maxStorageBuffersInVertexStage","maxStorageBuffersInFragmentStage","maxStorageTexturesPerShaderStage","maxStorageTexturesInVertexStage","maxStorageTexturesInFragmentStage","maxUniformBuffersPerShaderStage","minUniformBufferOffsetAlignment","minStorageBufferOffsetAlignment","maxVertexBuffers","maxVertexAttributes","maxVertexBufferArrayStride","maxInterStageShaderVariables","maxColorAttachments","maxColorAttachmentBytesPerSample","maxComputeWorkgroupStorageSize","maxComputeInvocationsPerWorkgroup","maxComputeWorkgroupSizeX","maxComputeWorkgroupSizeY","maxComputeWorkgroupSizeZ","maxComputeWorkgroupsPerDimension"];
+  var _wgpu32BitLimitNames = wgpuDecodeStrings('>1D >2D >3D<5eArrayLayers<9s<9sPlus7;s<BindingsPer9<Dynamic4m=Dynamic:=Sampled5e?axSampler?ax:;?ax:5e?ax4m;?in4m;6 min:;6<7;s<7Attributes<7;ArrayStride<InterStageShaderVariables<ColorAttachments<ColorAttachmentBytesPerSample@p:Size<ComputeInvocationsPerWorkgroup@pSizeX@pSizeY@pSizeZ@psPerDimension', ' maxComputeWorkgrou|sPerShaderStage m|maxTextureDimension|BuffersPerPipelineLayout max| max|Buffer|Storage|BindGroup|s8ColorAttachmen|Vertex|OffsetAlignment|Textur|Unifor', 52).slice(1);
   
-  var _wgpu64BitLimitNames = ["maxUniformBufferBindingSize","maxStorageBufferBindingSize","maxBufferSize"];
+  var _wgpu64BitLimitNames = wgpuDecodeStrings('maxUniform4Storage4BufferSize', 'BufferBindingSize max', 52).slice(1);
   
   function wgpuWriteI53ToU64HeapIdx(heap32Idx, number) {
       assert(heap32Idx != 0, "assert(heap32Idx != 0) failed!");
@@ -15722,10 +14959,10 @@ function dbg(text) {
   function wgpuReadFeaturesBitfield(heap32Idx) {
       let requiredFeatures = [], v = HEAPU32[heap32Idx];
   
-      assert(_wgpuFeatures.length == 22, "assert(_wgpuFeatures.length == 22) failed!");
+      assert(_wgpuFeatures.length == 21, "assert(_wgpuFeatures.length == 21) failed!");
       assert(_wgpuFeatures.length <= 30, "assert(_wgpuFeatures.length <= 30) failed!"); // We can only do up to 30 distinct feature bits here with the current code.
       
-      for(let i = 0; i < 22/*_wgpuFeatures.length*/; ++i) {
+      for(let i = 0; i < 21/*_wgpuFeatures.length*/; ++i) {
         if (v & (1 << i)) requiredFeatures.push(_wgpuFeatures[i]);
       } 
       return requiredFeatures;
@@ -15737,8 +14974,8 @@ function dbg(text) {
   
       return {
         'requiredLimits': wgpuReadSupportedLimits(descriptor),
-        'defaultQueue': wgpuReadQueueDescriptor(descriptor+38/*sizeof(WGpuSupportedLimits)*/),
-        'requiredFeatures': wgpuReadFeaturesBitfield(descriptor+40/*sizeof(WGpuSupportedLimits)+sizeof(WGpuQueueDescriptor)*/)
+        'defaultQueue': wgpuReadQueueDescriptor(descriptor+34/*sizeof(WGpuSupportedLimits)*/),
+        'requiredFeatures': wgpuReadFeaturesBitfield(descriptor+36/*sizeof(WGpuSupportedLimits)+sizeof(WGpuQueueDescriptor)*/)
       };
     }
   
@@ -15840,7 +15077,7 @@ function dbg(text) {
     }
 
   
-  var HTMLPredefinedColorSpaces = [,"srgb","srgb-linear","display-p3","display-p3-linear"];
+  var HTMLPredefinedColorSpaces = [,"srgb","display-p3"];
   
   function wgpuReadArrayOfItemsMaybeNull(itemDict, ptr, numItems) {
       assert(numItems >= 0, "assert(numItems >= 0) failed!");
@@ -16031,7 +15268,7 @@ function dbg(text) {
       assert(maxDrawCount >= 0, "assert(maxDrawCount >= 0) failed!");
   
       assert(colorAttachmentsIdx % 2 == 0, "assert(colorAttachmentsIdx % 2 == 0) failed!"); // Must be aligned at double boundary
-      assert(depthStencilAttachment == 0 || wgpu[depthStencilAttachment] instanceof GPUTexture || wgpu[depthStencilAttachment] instanceof GPUTextureView, "assert(depthStencilAttachment == 0 || wgpu[depthStencilAttachment] instanceof GPUTexture || wgpu[depthStencilAttachment] instanceof GPUTextureView) failed!"); // Must point to a valid WebGPU texture or texture view object if nonzero
+      assert(depthStencilAttachment == 0 || wgpu[depthStencilAttachment] instanceof GPUTextureView, "assert(depthStencilAttachment == 0 || wgpu[depthStencilAttachment] instanceof GPUTextureView) failed!"); // Must point to a valid WebGPU texture view object if nonzero
   
       assert(numColorAttachments >= 0, "assert(numColorAttachments >= 0) failed!");
       while(numColorAttachments--) {
@@ -16081,7 +15318,7 @@ function dbg(text) {
       wgpu[commandEncoder]['copyBufferToBuffer'](wgpu[source], sourceOffset, wgpu[destination], destinationOffset, size < 1/0 ? size : void 0);
     }
 
-  var GPUTextureAspects = [,"all","stencil-only","depth-only"];
+  var GPUTextureAspects = wgpuDecodeStrings('all stencilA depthA', '-only');
   function wgpuReadGpuTexelCopyTextureInfo(ptr) {
       assert(ptr, "assert(ptr) failed!");
       assert((ptr >> 2) << 2 == ptr);
@@ -16193,17 +15430,17 @@ function dbg(text) {
     }
 
   
-  var GPUBufferBindingTypes = [,"uniform","storage","read-only-storage"];
+  var GPUBufferBindingTypes = wgpuDecodeStrings('uniform A read-only-A', 'storage');
   
   
-  var GPUSamplerBindingTypes = [,"filtering","non-filtering","comparison"];
+  var GPUSamplerBindingTypes = wgpuDecodeStrings('Anon-Acomparison', 'filtering ');
   
-  var GPUTextureSampleTypes = [,"float","unfilterable-float","depth","sint","uint"];
+  var GPUTextureSampleTypes = wgpuDecodeStrings('Aunfilterable-Adepth sint uint', 'float ');
   
-  var GPUTextureViewDimensions = [,"1d","2d","2d-array","cube","cube-array","3d"];
+  var GPUTextureViewDimensions = wgpuDecodeStrings('1B 2dCA AC3d', '-array |d 2d|cube');
   
   
-  var GPUStorageTextureSampleTypes = [,"write-only","read-only","read-write"];
+  var GPUStorageTextureSampleTypes = wgpuDecodeStrings('A-BBA', 'only read-|write');
   function wgpuReadBindGroupLayoutDescriptor(entries, numEntries) {
       assert(numEntries >= 0, "assert(numEntries >= 0) failed!");
       assert(entries != 0 || numEntries == 0, "assert(entries != 0 || numEntries == 0) failed!"); // Must be non-null pointer
@@ -16361,9 +15598,9 @@ function dbg(text) {
       return wgpuStoreAndSetParent(device['createPipelineLayout'](desc), device);
     }
 
-  var GPUCompareFunctions = [,"never","less","equal","less-equal","greater","not-equal","greater-equal","always"];
+  var GPUCompareFunctions = wgpuDecodeStrings('neverA equalACB notCBCalways', '-equal |greater| less');
   
-  var GPUStencilOperations = [,"keep","zero","replace","invert","increment-clamp","decrement-clamp","increment-wrap","decrement-wrap"];
+  var GPUStencilOperations = wgpuDecodeStrings('keep zero replace invert inCBdeCBinCA deCA', 'crement-|clamp |wrap');
   function wgpuReadGpuStencilFaceState(idx) {
       assert(idx != 0, "assert(idx != 0) failed!");
       return {
@@ -16374,9 +15611,9 @@ function dbg(text) {
       };
     }
   
-  var GPUBlendOperations = [,"add","subtract","reverse-subtract","min","max"];
+  var GPUBlendOperations = wgpuDecodeStrings('add Areverse-Amin max', 'subtract ');
   
-  var GPUBlendFactors = [,"zero","one","src","one-minus-src","src-alpha","one-minus-src-alpha","dst","one-minus-dst","dst-alpha","one-minus-dst-alpha","src-alpha-saturated","constant","one-minus-constant","src1","one-minus-src1","src1-alpha","one-minus-src1-alpha"];
+  var GPUBlendFactors = wgpuDecodeStrings('zero one CFC CEFCE AFA AEFAE CE-saturated BFB DFD DEFDE', ' one-minus-|-alpha|src1|src|constant|dst');
   function wgpuReadGpuBlendComponent(idx) {
       assert(idx != 0, "assert(idx != 0) failed!");
       assert(GPUBlendOperations[HEAPU32[idx]], "assert(GPUBlendOperations[HEAPU32[idx]]) failed!");
@@ -16391,11 +15628,11 @@ function dbg(text) {
   
   
   
-  var GPUIndexFormats = [,"uint16","uint32"];
+  var GPUIndexFormats = wgpuDecodeStrings('A16 A32', 'uint');
   
   
   
-  var GPUPrimitiveTopologys = [,"point-list","line-list","line-strip","triangle-list","triangle-strip"];
+  var GPUPrimitiveTopologys = wgpuDecodeStrings('pointDADAB CDCB', '-list |triangle|-strip|line');
   
   function wgpuReadRenderPipelineDescriptor(descriptor) {
       assert(descriptor != 0, "assert(descriptor != 0) failed!");
@@ -16416,7 +15653,7 @@ function dbg(text) {
           depthStencilFormat = HEAPU32[depthStencilIdx],
           multisampleCount = HEAPU32[multisampleIdx],
           fragmentModule = HEAPU32[fragmentIdx+6],
-          pipelineLayoutId = HEAPU32[fragmentIdx+10], // sizeof(WGpuPipelineLayout)
+          pipelineLayoutId = HEAPU32[fragmentIdx+10], // sizeof(WGpuFragmentState)
           desc;
   
       assert(pipelineLayoutId <= 1/*"auto"*/ || wgpu[pipelineLayoutId], "assert(pipelineLayoutId <= 1/*'auto'*/ || wgpu[pipelineLayoutId]) failed!");
@@ -16519,11 +15756,11 @@ function dbg(text) {
     }
 
   
-  var GPUAddressModes = [,"clamp-to-edge","repeat","mirror-repeat"];
+  var GPUAddressModes = wgpuDecodeStrings('clamp-to-edge A mirror-A', 'repeat');
   
-  var GPUFilterModes = [,"nearest","linear"];
+  var GPUFilterModes = wgpuDecodeStrings('Aest liA', 'near');
   
-  var GPUMipmapFilterModes = [,"nearest","linear"];
+  var GPUMipmapFilterModes = wgpuDecodeStrings('Aest liA', 'near');
   
   function _wgpu_device_create_sampler(device, descriptor) {
       
@@ -16597,7 +15834,6 @@ function dbg(text) {
   
   
   
-  
   function _wgpu_device_create_texture(device, descriptor) {
       
       assert(device != 0, "assert(device != 0) failed!");
@@ -16618,8 +15854,7 @@ function dbg(text) {
         'sampleCount': HEAP32[descriptor+7],
         'dimension': HEAPU32[descriptor+8] + 'd',
         'format': GPUTextureAndVertexFormats[HEAPU32[descriptor+9]],
-        'usage': HEAPU32[descriptor+10],
-        'textureBindingViewDimension': GPUTextureViewDimensions[HEAPU32[descriptor+11]] // Only used in WebGPU compatibility mode, ignored by core devices.
+        'usage': HEAPU32[descriptor+10]
       };
       
       let texture = device['createTexture'](desc);
@@ -16910,8 +16145,6 @@ function dbg(text) {
       // N.b. buffer may be null here, in which case the existing buffer is intended to be unbound.
       assert(buffer == 0 || wgpu[buffer], "assert(buffer == 0 || wgpu[buffer]) failed!");
       assert(buffer == 0 || wgpu[buffer] instanceof GPUBuffer, "assert(buffer == 0 || wgpu[buffer] instanceof GPUBuffer) failed!");
-      assert(buffer != 0 || offset == 0, "assert(buffer != 0 || offset == 0) failed!");
-      assert(buffer != 0 || size <= 0, "assert(buffer != 0 || size <= 0) failed!");
       assert(Number.isSafeInteger(offset), "assert(Number.isSafeInteger(offset)) failed!");
       assert(offset >= 0, "assert(offset >= 0) failed!");
       assert(Number.isSafeInteger(size), "assert(Number.isSafeInteger(size)) failed!");
@@ -16947,7 +16180,6 @@ function dbg(text) {
   
   
   
-  
   function _wgpu_texture_create_view(texture, descriptor) {
       
       assert(texture != 0, "assert(texture != 0) failed!");
@@ -16966,7 +16198,6 @@ function dbg(text) {
         'mipLevelCount': HEAP32[descriptor+5],
         'baseArrayLayer': HEAP32[descriptor+6],
         'arrayLayerCount': HEAP32[descriptor+7],
-        'swizzle': UTF8ToString(descriptor*4+32) || 'rgba'
       } : void 0;
       ;
       return wgpuStoreAndSetParent(wgpu[texture]['createView'](desc), wgpu[texture]);
@@ -17277,7 +16508,6 @@ var wasmImports = {
   "JS_Cursor_SetShow": _JS_Cursor_SetShow,
   "JS_DOM_MapViewportCoordinateToElementLocalCoordinate": _JS_DOM_MapViewportCoordinateToElementLocalCoordinate,
   "JS_DOM_UnityCanvasSelector": _JS_DOM_UnityCanvasSelector,
-  "JS_DownloadTextFile": _JS_DownloadTextFile,
   "JS_Eval_OpenURL": _JS_Eval_OpenURL,
   "JS_FileSystem_Initialize": _JS_FileSystem_Initialize,
   "JS_FileSystem_Sync": _JS_FileSystem_Sync,
@@ -17297,8 +16527,6 @@ var wasmImports = {
   "JS_LinearAccelerationSensor_Stop": _JS_LinearAccelerationSensor_Stop,
   "JS_Log_Dump": _JS_Log_Dump,
   "JS_Log_StackTrace": _JS_Log_StackTrace,
-  "JS_Microphone_GetCurrentAccessState": _JS_Microphone_GetCurrentAccessState,
-  "JS_Microphone_GetPermissionAsync": _JS_Microphone_GetPermissionAsync,
   "JS_MobileKeybard_GetIgnoreBlurEvent": _JS_MobileKeybard_GetIgnoreBlurEvent,
   "JS_MobileKeyboard_GetKeyboardStatus": _JS_MobileKeyboard_GetKeyboardStatus,
   "JS_MobileKeyboard_GetText": _JS_MobileKeyboard_GetText,
@@ -17321,7 +16549,6 @@ var wasmImports = {
   "JS_ScreenOrientation_Lock": _JS_ScreenOrientation_Lock,
   "JS_SetMainLoop": _JS_SetMainLoop,
   "JS_Sound_Create_Channel": _JS_Sound_Create_Channel,
-  "JS_Sound_Create_With_Buffer": _JS_Sound_Create_With_Buffer,
   "JS_Sound_GetAudioBufferSampleRate": _JS_Sound_GetAudioBufferSampleRate,
   "JS_Sound_GetAudioContextSampleRate": _JS_Sound_GetAudioContextSampleRate,
   "JS_Sound_GetLength": _JS_Sound_GetLength,
@@ -17706,7 +16933,7 @@ var _GetCopyBufferAsCStr = Module["_GetCopyBufferAsCStr"] = createExportWrapper(
 /** @type {function(...*):?} */
 var _getMetricsInfo = Module["_getMetricsInfo"] = createExportWrapper("getMetricsInfo");
 /** @type {function(...*):?} */
-var _SendMessageNumber = Module["_SendMessageNumber"] = createExportWrapper("SendMessageNumber");
+var _SendMessageFloat = Module["_SendMessageFloat"] = createExportWrapper("SendMessageFloat");
 /** @type {function(...*):?} */
 var _SendMessageString = Module["_SendMessageString"] = createExportWrapper("SendMessageString");
 /** @type {function(...*):?} */
@@ -18125,6 +17352,7 @@ var unexportedSymbols = [
   'wgpuWriteI53ToU64HeapIdx',
   'wgpu_checked_shift',
   'utf8',
+  'wgpuDecodeStrings',
   'GPUTextureAndVertexFormats',
   'GPUBlendFactors',
   'GPUStencilOperations',
@@ -18171,15 +17399,6 @@ var unexportedSymbols = [
   'isPushedToDeinitializer',
   'LogErrorWithAdditionalInformation',
   'ExceptionsSeen',
-  'MediaAccessState',
-  'Microphone_Access',
-  'Microphone_DeviceChangeHandlerAttached',
-  'Microphones',
-  'Microphone_UpdateDevices',
-  'Microphone_GetMediaStream',
-  'Microphone_CopyAudioBuffer',
-  'Microphone_DecompressAudioBuffer',
-  'Microphone_CreateSoundClipForRecording',
   'mobile_input',
   'mobile_input_text',
   'mobile_input_hide_delay',
